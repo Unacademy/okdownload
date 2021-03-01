@@ -279,7 +279,11 @@ public class MultiPointOutputStream {
     synchronized void close(int blockIndex) throws IOException {
         final DownloadOutputStream outputStream = outputStreamMap.get(blockIndex);
         if (outputStream != null) {
-            outputStream.close();
+            synchronized (noSyncLengthMap) {
+                // make sure the length of noSyncLengthMap is equal to outputStreamMap
+                outputStreamMap.remove(blockIndex);
+                noSyncLengthMap.remove(blockIndex);
+            }
             outputStreamMap.remove(blockIndex);
             Util.d(TAG, "OutputStream close task[" + task.getId() + "] block[" + blockIndex + "]");
         }
