@@ -16,8 +16,6 @@
 
 package com.liulishuo.okdownload.core.download;
 
-import android.content.Context;
-import android.net.ConnectivityManager;
 import android.os.SystemClock;
 import android.support.annotation.NonNull;
 import android.support.annotation.Nullable;
@@ -55,7 +53,7 @@ public class DownloadCall extends NamedRunnable implements Comparable<DownloadCa
 
     private static final String TAG = "DownloadCall";
 
-    static final int MAX_COUNT_RETRY_FOR_FAILED = 10;
+    static final int MAX_COUNT_RETRY_FOR_PRECONDITION_FAILED = 10;
     public final DownloadTask task;
     public final boolean asyncExecuted;
     @NonNull final ArrayList<DownloadChain> blockChainList;
@@ -66,9 +64,6 @@ public class DownloadCall extends NamedRunnable implements Comparable<DownloadCa
 
     volatile Thread currentThread;
     @NonNull private final DownloadStore store;
-
-    private ConnectivityManager manager = null;
-
 
     private DownloadCall(DownloadTask task, boolean asyncExecuted, @NonNull DownloadStore store) {
         this(task, asyncExecuted, new ArrayList<DownloadChain>(), store);
@@ -140,7 +135,7 @@ public class DownloadCall extends NamedRunnable implements Comparable<DownloadCa
     public void execute() throws InterruptedException {
         currentThread = Thread.currentThread();
 
-        boolean retry = false;
+        boolean retry;
         int retryCount = 0;
 
         // ready param
@@ -150,100 +145,94 @@ public class DownloadCall extends NamedRunnable implements Comparable<DownloadCa
         // inspect task start
         inspectTaskStart();
         do {
-            if (manager == null) {
-                manager = (ConnectivityManager) OkDownload.with().context()
-                        .getSystemService(Context.CONNECTIVITY_SERVICE);
+            // 0. check basic param before start
+            if (task.getUrl().length() <= 0) {
+                this.cache = new DownloadCache.PreError(
+                        new IOException("unexpected url: " + task.getUrl()));
+                break;
             }
-            if(Util.isNetworkAvailable(manager)) {
-                // 0. check basic param before start
-                if (task.getUrl().length() <= 0) {
-                    this.cache = new DownloadCache.PreError(
-                            new IOException("unexpected url: " + task.getUrl()));
-                    break;
+
+            if (canceled) break;
+
+            // 1. create basic info if not exist
+            @NonNull final BreakpointInfo info;
+            try {
+                BreakpointInfo infoOnStore = store.get(task.getId());
+                if (infoOnStore == null) {
+                    info = store.createAndInsert(task);
+                } else {
+                    info = infoOnStore;
                 }
+                setInfoToTask(info);
+            } catch (IOException e) {
+                this.cache = new DownloadCache.PreError(e);
+                break;
+            }
+            if (canceled) break;
 
-                if (canceled) break;
+            // ready cache.
+            @NonNull final DownloadCache cache = createCache(info);
+            this.cache = cache;
 
-                // 1. create basic info if not exist
-                @NonNull final BreakpointInfo info;
-                try {
-                    BreakpointInfo infoOnStore = store.get(task.getId());
-                    if (infoOnStore == null) {
-                        info = store.createAndInsert(task);
-                    } else {
-                        info = infoOnStore;
-                    }
-                    setInfoToTask(info);
-                } catch (IOException e) {
-                    this.cache = new DownloadCache.PreError(e);
-                    break;
-                }
-                if (canceled) break;
+            // 2. remote check.
+            final BreakpointRemoteCheck remoteCheck = createRemoteCheck(info);
+            try {
+                remoteCheck.check();
+            } catch (IOException e) {
+                cache.catchException(e);
+                break;
+            }
+            cache.setRedirectLocation(task.getRedirectLocation());
 
-                // ready cache.
-                @NonNull final DownloadCache cache = createCache(info);
-                this.cache = cache;
+            // 3. waiting for file lock release after file path is confirmed.
+            fileStrategy.getFileLock().waitForRelease(task.getFile().getAbsolutePath());
 
-                // 2. remote check.
-                final BreakpointRemoteCheck remoteCheck = createRemoteCheck(info);
-                try {
-                    remoteCheck.check();
-                } catch (IOException e) {
-                    cache.catchException(e);
-                    break;
-                }
-                cache.setRedirectLocation(task.getRedirectLocation());
+            // 4. reuse another info if another info is idle and available for reuse.
+            OkDownload.with().downloadStrategy()
+                    .inspectAnotherSameInfo(task, info, remoteCheck.getInstanceLength());
 
-                // 3. waiting for file lock release after file path is confirmed.
-                fileStrategy.getFileLock().waitForRelease(task.getFile().getAbsolutePath());
-
-                // 4. reuse another info if another info is idle and available for reuse.
-                OkDownload.with().downloadStrategy()
-                        .inspectAnotherSameInfo(task, info, remoteCheck.getInstanceLength());
-
-                try {
-                    if (remoteCheck.isResumable()) {
-                        // 5. local check
-                        final BreakpointLocalCheck localCheck = createLocalCheck(info,
-                                remoteCheck.getInstanceLength());
-                        localCheck.check();
-                        if (localCheck.isDirty()) {
-                            Util.d(TAG, "breakpoint invalid: download from beginning because of "
-                                    + "local check is dirty " + task.getId() + " " + localCheck);
-                            // 6. assemble block data
-                            fileStrategy.discardProcess(task);
-                            assembleBlockAndCallbackFromBeginning(info, remoteCheck,
-                                    localCheck.getCauseOrThrow());
-                        } else {
-                            okDownload.callbackDispatcher().dispatch()
-                                    .downloadFromBreakpoint(task, info);
-                        }
-                    } else {
+            try {
+                if (remoteCheck.isResumable()) {
+                    // 5. local check
+                    final BreakpointLocalCheck localCheck = createLocalCheck(info,
+                            remoteCheck.getInstanceLength());
+                    localCheck.check();
+                    if (localCheck.isDirty()) {
                         Util.d(TAG, "breakpoint invalid: download from beginning because of "
-                                + "remote check not resumable " + task.getId() + " " + remoteCheck);
+                                + "local check is dirty " + task.getId() + " " + localCheck);
                         // 6. assemble block data
                         fileStrategy.discardProcess(task);
                         assembleBlockAndCallbackFromBeginning(info, remoteCheck,
-                                remoteCheck.getCauseOrThrow());
+                                localCheck.getCauseOrThrow());
+                    } else {
+                        okDownload.callbackDispatcher().dispatch()
+                                .downloadFromBreakpoint(task, info);
                     }
-                } catch (IOException e) {
-                    cache.setUnknownError(e);
-                    break;
-                }
-
-                // 7. start with cache and info.
-                start(cache, info);
-
-                if (canceled) break;
-
-                // 8. retry if failed.
-                if (cache.isFail()
-                        && retryCount++ < MAX_COUNT_RETRY_FOR_FAILED) {
-                    store.remove(task.getId());
-                    retry = true;
                 } else {
-                    retry = false;
+                    Util.d(TAG, "breakpoint invalid: download from beginning because of "
+                            + "remote check not resumable " + task.getId() + " " + remoteCheck);
+                    // 6. assemble block data
+                    fileStrategy.discardProcess(task);
+                    assembleBlockAndCallbackFromBeginning(info, remoteCheck,
+                            remoteCheck.getCauseOrThrow());
                 }
+            } catch (IOException e) {
+                cache.setUnknownError(e);
+                break;
+            }
+
+            // 7. start with cache and info.
+            start(cache, info);
+
+            if (canceled) break;
+
+            // 8. retry if precondition failed.
+            if (cache.isFail()
+                    && retryCount++ < MAX_COUNT_RETRY_FOR_PRECONDITION_FAILED) {
+                store.remove(task.getId());
+                retry = true;
+            } else {
+                retry = false;
             }
         } while (retry);
 
