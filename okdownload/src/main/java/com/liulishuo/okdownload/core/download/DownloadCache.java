@@ -100,6 +100,11 @@ public class DownloadCache {
                 || fileBusyAfterRun || preAllocateFailed;
     }
 
+    public boolean isFail() {
+        return preconditionFailed  || serverCanceled || unknownError
+                || fileBusyAfterRun || preAllocateFailed;
+    }
+
     public void setPreconditionFailed(IOException realCause) {
         this.preconditionFailed = true;
         this.realCause = realCause;

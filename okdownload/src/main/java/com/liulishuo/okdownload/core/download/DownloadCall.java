@@ -53,7 +53,7 @@ public class DownloadCall extends NamedRunnable implements Comparable<DownloadCa
 
     private static final String TAG = "DownloadCall";
 
-    static final int MAX_COUNT_RETRY_FOR_PRECONDITION_FAILED = 1;
+    static final int MAX_COUNT_RETRY_FOR_PRECONDITION_FAILED = 10;
     public final DownloadTask task;
     public final boolean asyncExecuted;
     @NonNull final ArrayList<DownloadChain> blockChainList;
@@ -227,7 +227,7 @@ public class DownloadCall extends NamedRunnable implements Comparable<DownloadCa
             if (canceled) break;
 
             // 8. retry if precondition failed.
-            if (cache.isPreconditionFailed()
+            if (cache.isFail()
                     && retryCount++ < MAX_COUNT_RETRY_FOR_PRECONDITION_FAILED) {
                 store.remove(task.getId());
                 retry = true;
